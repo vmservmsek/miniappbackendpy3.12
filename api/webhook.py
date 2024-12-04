@@ -10,16 +10,27 @@ from firebase_admin import credentials, firestore, storage
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
 
-# Initialize the bot
+# Get environment variables
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-bot = AsyncTeleBot(BOT_TOKEN)
+FIREBASE_SERVICE_ACCOUNT = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
 
-# Initialize Firebase 
-firebase_config = json.loads(os.environ.get('FIREBASE_SERVICE_ACCOUNT'))
-cred = credentials.Certificate(firebase_config)
-firebase_admin.initialize_app(cred, {'storageBucket': 'telegram-mini-app-c9a1b.appspot.com'})
-db = firestore.client()
-bucket = storage.bucket()
+if not BOT_TOKEN:
+    raise EnvironmentError("Missing BOT_TOKEN environment variable.")
+
+if not FIREBASE_SERVICE_ACCOUNT:
+    raise EnvironmentError("Missing FIREBASE_SERVICE_ACCOUNT environment variable.")
+
+try:
+    firebase_config = json.loads(FIREBASE_SERVICE_ACCOUNT)
+    cred = credentials.Certificate(firebase_config)
+    firebase_admin.initialize_app(cred, {'storageBucket': 'telegram-mini-app-c9a1b.appspot.com'})
+    db = firestore.client()
+    bucket = storage.bucket()
+except Exception as e:
+    raise RuntimeError(f"Firebase initialization failed: {str(e)}")
+
+# Initialize the bot
+bot = AsyncTeleBot(BOT_TOKEN)
 
 def generate_start_keyboard():
     keyboard = InlineKeyboardMarkup()
@@ -33,7 +44,7 @@ async def start(message):
     user_last_name = message.from_user.last_name
     user_username = message.from_user.username
     user_language_code = str(message.from_user.language_code)
-    is_premium = message.from_user.is_premium  # Handle cases where the attribute might not exist
+    is_premium = getattr(message.from_user, 'is_premium', False)
     text = message.text.split()
     welcome_message = (
         f"Hi, {user_first_name}! 👋\n\n"
@@ -48,21 +59,17 @@ async def start(message):
 
         if not user_doc.exists:
             photos = await bot.get_user_profile_photos(user_id, limit=1)
+            user_image = None
             if photos.total_count > 0:
                 file_id = photos.photos[0][-1].file_id
                 file_info = await bot.get_file(file_id)
-                file_path = file_info.file_path
-                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
 
                 response = requests.get(file_url)
                 if response.status_code == 200:
                     blob = bucket.blob(f"user_images/{user_id}.jpg")
                     blob.upload_from_string(response.content, content_type='image/jpeg')
                     user_image = blob.generate_signed_url(datetime.timedelta(days=365), method='GET')
-                else:
-                    user_image = None
-            else:
-                user_image = None
 
             user_data = {
                 'userImage': user_image,
@@ -94,9 +101,6 @@ async def start(message):
                     referrer_data = referrer_doc.to_dict()
                     bonus_amount = 500 if is_premium else 100
 
-                    current_balance = referrer_data.get('balance', 0)
-                    new_balance = current_balance + bonus_amount
-
                     referrals = referrer_data.get('referrals', {})
                     referrals[user_id] = {
                         'addedValue': bonus_amount,
@@ -106,40 +110,44 @@ async def start(message):
                     }
 
                     referrer_ref.update({
-                        'balance': new_balance,
+                        'balance': referrer_data.get('balance', 0) + bonus_amount,
                         'referrals': referrals
                     })
-                else:
-                    user_data['referredBy'] = None
-            else:
-                user_data['referredBy'] = None
-
             user_ref.set(user_data)
 
         keyboard = generate_start_keyboard()
         await bot.reply_to(message, welcome_message, reply_markup=keyboard)
 
     except Exception as e:
-        error_message = "Error. Please try again!"
+        error_message = "An error occurred. Please try again later."
         await bot.reply_to(message, error_message)
-        print(f"Error: {str(e)}")
+        print(f"Error in /start: {str(e)}")
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        update_dict = json.loads(post_data.decode('utf-8'))
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            update_dict = json.loads(post_data.decode('utf-8'))
 
-        asyncio.run(self.process_update(update_dict))
+            asyncio.run(self.process_update(update_dict))
 
-        self.send_response(200)
-        self.end_headers()
+            self.send_response(200)
+            self.end_headers()
+        except Exception as e:
+            print(f"Error in POST request: {str(e)}")
+            self.send_response(500)
+            self.end_headers()
 
     async def process_update(self, update_dict):
-        update = types.Update.de_json(update_dict)
-        await bot.process_new_updates([update])
+        try:
+            update = types.Update.de_json(update_dict)
+            await bot.process_new_updates([update])
+        except Exception as e:
+            print(f"Error in processing update: {str(e)}")
 
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write("Bot is running".encode())
+        self.wfile.write(b"Bot is running")
+
